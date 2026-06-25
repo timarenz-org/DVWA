@@ -1,0 +1,186 @@
+name: dvwa-gke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-scan-push-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "$GAR_HOST" --quiet
+        env:
+          GAR_HOST: ${{ vars.GAR_HOST }}
+
+      - name: Download Wiz CLI
+        run: curl -fsSL "$WIZCLI_DOWNLOAD_URL" -o wizcli && chmod +x wizcli
+        env:
+          WIZCLI_DOWNLOAD_URL: ${{ vars.WIZCLI_DOWNLOAD_URL }}
+
+      - name: Build DVWA image
+        env:
+          DVWA_IMAGE_NAME: ${{ vars.DVWA_IMAGE_NAME }}
+          GAR_REPOSITORY_URL: ${{ vars.GAR_REPOSITORY_URL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          DVWA_IMAGE="$GAR_REPOSITORY_URL/$DVWA_IMAGE_NAME:$GITHUB_SHA"
+          OCI_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          docker build . \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$OCI_CREATED" \
+            --tag "$DVWA_IMAGE"
+
+          echo "DVWA_IMAGE=$DVWA_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Wiz CLI scan DVWA image
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+          WIZ_POLICY: ${{ vars.WIZ_POLICY }}
+        run: ./wizcli scan container-image "$DVWA_IMAGE" --dockerfile Dockerfile --policies "$WIZ_POLICY"
+
+      - name: Push DVWA image
+        run: docker push "$DVWA_IMAGE"
+
+      - name: Tag DVWA image in Wiz
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: ./wizcli tag "$DVWA_IMAGE"
+
+      - name: Get GKE credentials
+        run: gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_CLUSTER_LOCATION" --project "$GCP_PROJECT_ID"
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GKE_CLUSTER_LOCATION: ${{ vars.GKE_CLUSTER_LOCATION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+
+      - name: Deploy DVWA workloads
+        env:
+          DVWA_DEFAULT_SECURITY_LEVEL: ${{ vars.DVWA_DEFAULT_SECURITY_LEVEL }}
+          GKE_NAMESPACE: ${{ vars.GKE_NAMESPACE }}
+          GKE_SERVICE_ACCOUNT: ${{ vars.GKE_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+
+          cat <<YAML | sed \
+            -e "s|IMAGE_DVWA|$DVWA_IMAGE|g" \
+            -e "s|DEFAULT_SECURITY_LEVEL_VALUE|$DVWA_DEFAULT_SECURITY_LEVEL|g" \
+            -e "s|SERVICE_ACCOUNT_NAME|$GKE_SERVICE_ACCOUNT|g" \
+            -e "s|NAMESPACE_NAME|$GKE_NAMESPACE|g" \
+            | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            labels:
+              app: dvwa-db
+              app.kubernetes.io/part-of: dvwa
+            name: dvwa-db
+            namespace: NAMESPACE_NAME
+          spec:
+            selector:
+              app: dvwa-db
+            ports:
+              - name: mysql
+                port: 3306
+                targetPort: mysql
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            labels:
+              app: dvwa-db
+              app.kubernetes.io/part-of: dvwa
+            name: dvwa-db
+            namespace: NAMESPACE_NAME
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: dvwa-db
+            template:
+              metadata:
+                labels:
+                  app: dvwa-db
+                  app.kubernetes.io/part-of: dvwa
+              spec:
+                containers:
+                  - name: mariadb
+                    image: docker.io/library/mariadb:10
+                    imagePullPolicy: IfNotPresent
+                    envFrom:
+                      - secretRef:
+                          name: dvwa-database
+                    ports:
+                      - name: mysql
+                        containerPort: 3306
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/mysql
+                volumes:
+                  - name: data
+                    emptyDir: {}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            labels:
+              app: dvwa
+              app.kubernetes.io/part-of: dvwa
+            name: dvwa
+            namespace: NAMESPACE_NAME
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: dvwa
+            template:
+              metadata:
+                labels:
+                  app: dvwa
+                  app.kubernetes.io/part-of: dvwa
+              spec:
+                serviceAccountName: SERVICE_ACCOUNT_NAME
+                containers:
+                  - name: dvwa
+                    image: IMAGE_DVWA
+                    imagePullPolicy: Always
+                    env:
+                      - name: DEFAULT_SECURITY_LEVEL
+                        value: DEFAULT_SECURITY_LEVEL_VALUE
+                    envFrom:
+                      - secretRef:
+                          name: dvwa-database
+                    ports:
+                      - name: http
+                        containerPort: 80
+          YAML
+
+          kubectl rollout status deployment/dvwa-db --namespace "$GKE_NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/dvwa --namespace "$GKE_NAMESPACE" --timeout=300s
